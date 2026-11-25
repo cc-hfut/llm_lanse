@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+training_results/
+/data/*
+!/data/nasa_global_landslide_catalog_point.csv
+*.kv
+*.kv.*
+/Qwen3-Embedding-8B-GGUF/
+*.gguf
+/position_prediction/data/
+/position_prediction/results/

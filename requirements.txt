@@ -1,0 +1,7 @@
+torch
+numpy
+scipy
+gensim
+pandas
+openpyxl
+llama-cpp-python

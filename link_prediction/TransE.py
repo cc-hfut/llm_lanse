@@ -1,0 +1,329 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import random
+import json
+import os
+from common.formal_outputs import save_metrics, export_geo_head_top1
+import numpy as np  # Use NumPy for metric calculation.
+
+from gensim.models import KeyedVectors
+
+# Detect GPU availability.
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+RESULT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'training_results', 'TransE')
+os.makedirs(RESULT_DIR, exist_ok=True)
+log = open(os.path.join(RESULT_DIR, 'TransE.log'), 'w', encoding='utf-8')
+
+
+# Load (h, r, t) triples and map names to IDs.
+def load_triples(path, ent2id, rel2id):
+    triples = []
+    with open(path, 'r', encoding='utf-8') as f:
+        for line in f:
+            h, r, t = line.strip().split('\t')  # Split tab-separated head, relation, and tail fields.
+            if h in ent2id and t in ent2id and r in rel2id:  # Check that all names have ID mappings.
+                # Append the ID-based triple.
+                triples.append((ent2id[h], rel2id[r], ent2id[t]))
+    return triples
+
+
+# Load entity or relation ID mappings, such as entity2id.txt.
+def load_mapping(path):
+    mapping = {}
+    with open(path, 'r', encoding='utf-8') as f:
+        for line in f:
+            name, idx = line.strip().split('\t')  # Read the name and its ID.
+            mapping[name] = int(idx)  # Convert the ID to an integer.
+    return mapping
+
+
+# Define the TransE model.
+class TransE(nn.Module):
+    def __init__(self, num_entities, num_relations, dim=100, p_norm=1, margin=1.0):
+        super().__init__()  # Initialize the nn.Module base class.
+        self.ent_emb = nn.Embedding(num_entities, dim)  # Entity embedding matrix
+        self.rel_emb = nn.Embedding(num_relations, dim)  # Relation embedding matrix
+        self.p_norm = p_norm  # Distance norm, usually 1 or 2.
+        self.margin = margin  # Margin hyperparameter for the loss.
+        self.reset_parameters()  # Initialize parameters.
+        self.qwen_dim = 100
+
+    # Initialize embedding parameters.
+    def reset_parameters(self):
+        r = 6.0 / (self.ent_emb.embedding_dim ** 0.5)  # Xavier initialization range
+        nn.init.uniform_(self.ent_emb.weight, -r, r)
+        nn.init.uniform_(self.rel_emb.weight, -r, r)
+
+    def entity_encoder(self, entity):
+        entity_embedding = self.ent_emb(entity)
+        return entity_embedding
+
+    # Forward pass: compute the L1/L2 norm of h + r - t.
+    def forward(self, h, r, t):
+        h_e = self.entity_encoder(h)  # Look up head embeddings.
+        r_e = self.rel_emb(r)  # Look up relation embeddings.
+        t_e = self.entity_encoder(t)  # Look up tail embeddings.
+        return torch.norm(h_e + r_e - t_e, p=self.p_norm, dim=1)  # Return scores for the batch of triples.
+
+    # Margin loss encourages positive distances to be smaller than negative distances.
+    def loss_fn(self, pos_score, neg_score):
+        return torch.relu(pos_score + self.margin - neg_score).mean()  # max(0, positive + margin - negative)
+
+    # ------------------ Forward pass with cached embeddings ------------------
+    def forward_with_embeddings(self, h_emb, r_emb, t_emb):
+        'Run a forward pass with precomputed embeddings.\n\nArgs:\n    h_emb: Head embeddings [B, dim].\n    r_emb: Relation embeddings [B, dim].\n    t_emb: Tail embeddings [B, dim].\nReturns:\n    Distance scores [B]; lower is better.'
+        return torch.norm(h_emb + r_emb - t_emb, p=self.p_norm, dim=1)
+
+
+# Generate negative triples by randomly replacing heads or tails.
+def generate_negative_batch(batch, num_entities):
+    neg_batch = []
+    for h, r, t in batch:
+        if random.random() < 0.5:
+            h = random.randint(0, num_entities - 1)  # Replace the head.
+        else:
+            t = random.randint(0, num_entities - 1)  # Replace the tail.
+        neg_batch.append((h, r, t))
+    return neg_batch
+
+
+# ------------------ Validation loss ------------------
+def evaluate_loss_on_validation(model, val_data, num_entities, batch_size=128):
+    'Compute the mean validation loss.'
+    model.eval()
+    total_loss = 0
+    num_batches = 0
+    with torch.no_grad():
+        for i in range(0, len(val_data), batch_size):
+            pos_batch = val_data[i:i + batch_size]
+            neg_batch = generate_negative_batch(pos_batch, num_entities)
+            pos = torch.LongTensor(pos_batch).T.to(device)
+            neg = torch.LongTensor(neg_batch).T.to(device)
+            pos_score = model(*pos)
+            neg_score = model(*neg)
+            loss = model.loss_fn(pos_score, neg_score)
+            total_loss += loss.item()
+            num_batches += 1
+    model.train()  # Restore training mode.
+    return total_loss / num_batches if num_batches > 0 else float('inf')
+
+
+# Training loop
+def train(model, optimizer, train_data, val_data, num_entities, batch_size=128, epochs=1000,
+          save_path="best_TransE.pt", patience=30):
+    model.to(device)
+    best_val_loss = float("inf")  # Use validation loss for early stopping.
+    epochs_no_improve = 0
+    early_stop = False
+
+    for epoch in range(1, epochs + 1):
+        if early_stop:
+            print(f"Early stopping at epoch {epoch}")
+            log.write(f"Early stopping at epoch {epoch}\n")
+            break
+
+        random.shuffle(train_data)  # Shuffle training triples each epoch.
+        total_loss = 0
+        for i in range(0, len(train_data), batch_size):  # Train in batches.
+            pos_batch = train_data[i:i + batch_size]  # Positive batch
+            neg_batch = generate_negative_batch(pos_batch, num_entities)  # Generate negative samples.
+
+            pos = torch.LongTensor(pos_batch).T.to(device)  # Move tensors to the model device.
+            neg = torch.LongTensor(neg_batch).T.to(device)  # Move tensors to the model device.
+
+            pos_score = model(*pos)  # Score positive triples.
+            neg_score = model(*neg)  # Score negative triples.
+            loss = model.loss_fn(pos_score, neg_score)  # Compute the loss.
+
+            optimizer.zero_grad()  # Clear gradients.
+            loss.backward()  # Backpropagate gradients.
+            optimizer.step()  # Update parameters.
+            total_loss += loss.item()
+
+        avg_train_loss = total_loss / (len(train_data) // batch_size)
+
+        # ------------------ Validation ------------------
+        val_loss = evaluate_loss_on_validation(model, val_data, num_entities, batch_size)
+        print(f"Epoch {epoch}: Avg Train Loss = {avg_train_loss:.4f}, Avg Val Loss = {val_loss:.4f}")
+        log.write(f"Epoch {epoch}: Avg Train Loss = {avg_train_loss:.4f}, Avg Val Loss = {val_loss:.4f}\n")
+
+        # ------------------ Early stopping based on validation loss ------------------
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            epochs_no_improve = 0
+            # Save the checkpoint with the lowest validation loss.
+            torch.save(model.state_dict(), save_path)
+            print(f"✔ Saved best model (based on val loss) at epoch {epoch} with val loss {val_loss:.4f}")
+            log.write(f"✔ Saved best model (based on val loss) at epoch {epoch} with val loss {val_loss:.4f}\n")
+        else:
+            epochs_no_improve += 1
+            if epochs_no_improve >= patience:
+                print(f"Validation loss didn't improve for {patience} epochs. Early stopping...")
+                log.write(f"Validation loss didn't improve for {patience} epochs. Early stopping...\n")
+                early_stop = True
+
+    # Restore the best checkpoint after training.
+    try:
+        model.load_state_dict(torch.load(save_path, map_location=device))
+        print(f"Loaded best model from {save_path}")
+        log.write(f"Loaded best model from {save_path}\n")
+    except FileNotFoundError:
+        print(f"Warning: Best model file {save_path} not found. Continuing with final model state.")
+        log.write(f"Warning: Best model file {save_path} not found. Continuing with final model state.\n")
+
+
+# Dataset splitting helper
+def split_dataset(triples, train_ratio=0.9, valid_ratio=0.09):  # Default ratios retained for compatibility with the original implementation.
+    random.shuffle(triples)
+    total = len(triples)
+    train_end = int(train_ratio * total)
+    valid_end = int((train_ratio + valid_ratio) * total)
+    return triples[:train_end], triples[train_end:valid_end], triples[valid_end:]
+
+
+# ------------------ Batched evaluation ------------------
+def precompute_embeddings(model, ent_total, rel_total):
+    'Precompute entity and relation embeddings.\n\nArgs:\n    model: A TransE model.\n    ent_total: Number of entities.\n    rel_total: Number of relations.\nReturns:\n    Entity and relation embedding tensors, each shaped [total, dim].'
+    model.eval()
+    with torch.no_grad():
+        # Create tensors for all entity and relation IDs.
+        all_ent_ids = torch.arange(ent_total, device=device)  # [E]
+        all_rel_ids = torch.arange(rel_total, device=device)  # [R]
+        # Compute embeddings.
+        ent_emb = model.entity_encoder(all_ent_ids)  # [E, dim]
+        rel_emb = model.rel_emb(all_rel_ids)  # [R, dim]
+    return ent_emb, rel_emb
+
+
+def evaluate_hit_at_k_batch_optimized(model, test_triples, ent_total, rel_total, all_true_triples,
+                                      batch_size=128, k_list=[1, 3, 10]):
+    'Evaluate Hits@K in batches using cached entity and relation embeddings.\n\nArgs:\n    model: Trained model.\n    test_triples: Test triples [(h, r, t), ...].\n    ent_total: Number of entities.\n    rel_total: Number of relations.\n    all_true_triples: Known positive triples used for filtering.\n    batch_size: Evaluation batch size.\n    k_list: Values of K for Hits@K.'
+    model.eval()
+    hits = {k: 0 for k in k_list}
+    ranks = []
+    total = len(test_triples)
+    # ------------------ Precompute entity and relation embeddings ------------------
+    print("Precomputing entity and relation embeddings...")
+    precomputed_ent_emb, precomputed_rel_emb = precompute_embeddings(model, ent_total, rel_total)  # [E, dim], [R, dim]
+    print("Precomputation done.")
+
+    with torch.no_grad():
+        # Process test triples in batches.
+        for i in range(0, total, batch_size):
+            batch_triples = test_triples[i:i + batch_size]
+            batch_size_current = len(batch_triples)
+            # Build the batch ID tensors.
+            h_batch_ids = torch.tensor([t[0] for t in batch_triples], device=device)  # [B]
+            r_batch_ids = torch.tensor([t[1] for t in batch_triples], device=device)  # [B]
+            t_batch_ids = torch.tensor([t[2] for t in batch_triples], device=device)  # [B]
+
+            # ------------------ Index precomputed embeddings ------------------
+            # Index precomputed embeddings by ID: [B, dim].
+            h_batch_emb = precomputed_ent_emb[h_batch_ids]  # [B, dim]
+            r_batch_emb = precomputed_rel_emb[r_batch_ids]  # [B, dim]
+            # Prepare embeddings for all tail candidates: [B, E, dim].
+            t_candidate_embs = precomputed_ent_emb.unsqueeze(0).expand(batch_size_current, -1, -1)  # [B, E, dim]
+
+            # ------------------ Compute scores ------------------
+            # Expand heads and relations: [B, dim] -> [B, E, dim].
+            h_exp = h_batch_emb.unsqueeze(1).expand(-1, ent_total, -1)  # [B, E, dim]
+            r_exp = r_batch_emb.unsqueeze(1).expand(-1, ent_total, -1)  # [B, E, dim]
+
+            # Reshape to [B*E, dim] for batched computation.
+            h_flat = h_exp.reshape(-1, h_exp.shape[-1])  # [B*E, dim]
+            r_flat = r_exp.reshape(-1, r_exp.shape[-1])  # [B*E, dim]
+            t_flat = t_candidate_embs.reshape(-1, t_candidate_embs.shape[-1])  # [B*E, dim]
+
+            # Score all (h, r, t_candidate) triples.
+            scores_flat = model.forward_with_embeddings(h_flat, r_flat, t_flat)  # [B*E]
+            scores = scores_flat.view(batch_size_current, ent_total)  # [B, E]
+
+            # ------------------ Filter known triples ------------------
+            filter_mask = torch.zeros_like(scores, dtype=torch.bool)  # [B, E]
+            for idx, (h, r, t) in enumerate(batch_triples):
+                # Filter known (h, r, t_other) positives while retaining the current target t.
+                for t_candidate in range(ent_total):
+                    if (h, r, t_candidate) in all_true_triples and t_candidate != t:
+                        filter_mask[idx, t_candidate] = True
+            # Set filtered distances to infinity so they cannot be selected.
+            scores.masked_fill_(filter_mask, float('inf'))
+
+            # ------------------ Sort candidates and compute ranks ------------------
+            # Sort distances in ascending order; lower is better.
+            _, sorted_indices = torch.sort(scores, dim=1, descending=False)  # [B, E]
+            # Find the rank of each correct tail using vectorized operations.
+            expanded_t_ids = t_batch_ids.unsqueeze(1)  # [B, 1]
+            matches = (sorted_indices == expanded_t_ids)  # [B, E] bool
+            # Find the first True column in each row.
+            rank_indices = matches.float().argmax(dim=1)  # [B] (0-based index)
+            ranks_batch = (rank_indices + 1).cpu().numpy()  # [B] (1-based rank)
+            ranks.extend(ranks_batch.tolist())
+
+            # Compute Hits@K using vectorized operations.
+            for k in k_list:
+                hits[k] += (ranks_batch <= k).sum().item()
+
+    # Compute final metrics.
+    hit_results = {k: hits[k] / total for k in k_list}
+    mrr = np.mean(1.0 / np.array(ranks))
+    mr = np.mean(ranks)
+    # Report results.
+    print(f"MR: {mr:.4f}")
+    print(f"MRR: {mrr:.4f}")
+    for k in k_list:
+        print(f"Hit@{k}: {hit_results[k]:.4f}")
+        log.write(f"Hit@{k}: {hit_results[k]:.4f}\n")
+    log.write(f"MR: {mr:.4f}\n")
+    log.write(f"MRR: {mrr:.4f}\n")
+    return hit_results, mr, mrr
+
+
+if __name__ == '__main__':
+    # Load entity and relation ID mappings.
+    ent2id = load_mapping(r"../data/entity2id.txt")
+    rel2id = load_mapping(r"../data/rel2id.txt")
+
+    # Load all triples.
+    all_triples = load_triples(r"../data/landslide.txt", ent2id, rel2id)
+
+    # Load dataset splits.
+    train_data = load_triples(r"../data/train.txt", ent2id, rel2id)
+    val_data = load_triples(r"../data/valid.txt", ent2id, rel2id)
+    test_data = load_triples(r"../data/test.txt", ent2id, rel2id)
+
+    # Build the known-positive triple set for filtered evaluation.
+    all_true_triples = set(train_data + val_data + test_data)
+
+    # Initialize the model.
+    model = TransE(
+        num_entities=len(ent2id) + 2,
+        num_relations=len(rel2id) + 2,
+        dim=100,
+        p_norm=1,
+        margin=1.0
+    )
+
+    # Initialize the optimizer.
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
+
+    # Train the model.
+    train(model, optimizer, train_data, val_data, num_entities=len(ent2id), epochs=1000,
+          save_path=os.path.join(RESULT_DIR, "best_TransE.pt"), patience=30)
+
+    # Load the best checkpoint for final testing.
+    # The train function already attempts to restore the best checkpoint.
+    print("=== Testing on Test Set (Optimized Batch Evaluation with Precomputed Embeddings) ===")
+    hits, mr, mrr = evaluate_hit_at_k_batch_optimized(
+        model,
+        test_data,
+        ent_total=len(ent2id),
+        rel_total=len(rel2id),  # Pass the relation count.
+        all_true_triples=all_true_triples,
+        batch_size=64,  # Adjust according to available GPU memory.
+        k_list=[1, 3, 10]
+    )
+    save_metrics(RESULT_DIR, 'TransE', hits, mr, mrr)
+    export_geo_head_top1(model, 'TransE', test_data, all_true_triples, ent2id, rel2id, RESULT_DIR, device)
+    log.close()
